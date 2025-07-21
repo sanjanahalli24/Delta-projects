@@ -1,0 +1,302 @@
+import os
+import re
+import string
+import pandas as pd
+import numpy as np
+from indicnlp.tokenize import indic_tokenize
+from sklearn.preprocessing import LabelEncoder
+from keras.utils import pad_sequences
+import dgl
+import networkx as nx
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import BertTokenizer, BertModel
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.model_selection import train_test_split
+import nltk
+
+nltk.download('stopwords')
+
+# ===================== #
+# --- Preprocessing --- #
+# ===================== #
+kannada_punctuations = set(string.punctuation).union({'।', '॥'})
+custom_kannada_stopwords = {'ಇದು', 'ಮತ್ತು', 'ಆದರೆ', 'ಇಲ್ಲಿ', 'ಅಲ್ಲಿ', 'ನಾವು', 'ನೀವು', 'ಅವರು', 'ಇಂತಿ', 'ಅಂತು',
+                            'ಕೆಲವು', 'ನಾನು', 'ನನ್ನ', 'ನಿನ್ನ', 'ನಿಮ್ಮ', 'ಅದು', 'ಏಕೆ', 'ಏನು', 'ಹೇಗೆ', 'ಯಾಕೆ',
+                            'ಯಾರು', 'ಯಾವ', 'ಎಲ್ಲಿ', 'ಯಾವುದು', 'ನನ್ನನ್ನು', 'ನೀನು', 'ನೀನೆ', 'ನಿಮ್ಮದು', 'ಈ', 'ನನಗೆ'}
+
+def load_suffixes(file_path=r"C:\Users\DELL\Desktop\sentiment-analysis-kannada-main\Sentiment With Custom input\kannada_suffixes.txt"):
+    with open(file_path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+verb_suffixes = load_suffixes()
+
+def kannada_stemmer(word):
+    for suffix in sorted(verb_suffixes, key=len, reverse=True):
+        if word.endswith(suffix) and len(word) > len(suffix) + 2:
+            return word[:-len(suffix)]
+    return word
+
+def preprocess_kannada_text_stepwise(text):
+    if not isinstance(text, str):
+        text = " " if pd.isna(text) else str(text)
+
+    tokens = indic_tokenize.trivial_tokenize(text)
+    tokens_no_punct = [token for token in tokens if token not in kannada_punctuations]
+    tokens_no_stop = [word for word in tokens_no_punct if word not in custom_kannada_stopwords]
+    tokens_stemmed = [kannada_stemmer(token) for token in tokens_no_stop]
+    final_text = ' '.join(tokens_stemmed)
+    return tokens, tokens_no_punct, tokens_no_stop, tokens_stemmed, final_text
+
+# ======================== #
+# --- Load and Split Data --- #
+# ======================== #
+df = pd.read_excel(r"C:\\Users\\DELL\\Desktop\\sentiment-analysis-kannada-main\\Pure7K.xlsx")
+text_column, label_column = 'Sentences', 'sentiment'
+df['Preprocessed_Sentences'] = df[text_column].apply(lambda x: preprocess_kannada_text_stepwise(x)[-1])
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+
+# ======================== #\|
+
+# --- BERT Integration --- #
+# ======================== #
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+tokenizer = BertTokenizer.from_pretrained(r'E:\bert-base')
+bert_model = BertModel.from_pretrained(r'E:\bert-base')
+bert_model.to(device)
+bert_model.eval()
+
+def get_bert_embeddings(sentences):
+    embeddings = []
+    with torch.no_grad():
+        for sentence in sentences:
+            inputs = tokenizer(sentence, return_tensors='pt', truncation=True, padding='max_length', max_length=50)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            outputs = bert_model(**inputs)
+            cls_embedding = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
+            embeddings.append(cls_embedding)
+    return np.array(embeddings)
+    #print(embeddings)
+
+X_train = get_bert_embeddings(train_df['Preprocessed_Sentences'])
+X_test = get_bert_embeddings(test_df['Preprocessed_Sentences'])
+
+# Print the embedding of the first training sentence
+print("BERT Embedding for first training sample:")
+print(X_train[0])
+
+encoder = LabelEncoder()
+y_train = encoder.fit_transform(train_df[label_column])
+y_test = encoder.transform(test_df[label_column])
+y_train_oh = pd.get_dummies(y_train).values
+
+# ======================= #
+# --- Graph Building --- #
+# ======================= #
+def build_graph(X_data):
+    G = nx.Graph()
+    for i in range(len(X_data)):
+        G.add_node(i, features=X_data[i])
+        if i > 0:
+            G.add_edge(i - 1, i)
+    return dgl.from_networkx(G, node_attrs=['features'])
+
+graph_train = build_graph(X_train)
+features_train = torch.tensor(X_train, dtype=torch.float32).to(device)
+labels_train = torch.tensor(np.argmax(y_train_oh, axis=1), dtype=torch.long).to(device)
+
+# ==================== #
+# --- GNN Model --- #
+# ==================== #
+class GNNModel(nn.Module):
+    def _init_(self, in_feats, hidden_feats, out_feats):
+        super(GNNModel, self)._init_()
+        self.layer1 = nn.Linear(in_feats, hidden_feats)
+        self.bn1 = nn.BatchNorm1d(hidden_feats)
+        self.dropout1 = nn.Dropout(0.3)
+        self.layer2 = nn.Linear(hidden_feats, hidden_feats)
+        self.bn2 = nn.BatchNorm1d(hidden_feats)
+        self.dropout2 = nn.Dropout(0.3)
+        self.layer3 = nn.Linear(hidden_feats, out_feats)
+
+    def forward(self, g, features):
+        h = F.leaky_relu(self.bn1(self.layer1(features)))
+        h = self.dropout1(h)
+        h = F.leaky_relu(self.bn2(self.layer2(h)))
+        h = self.dropout2(h)
+        h = self.layer3(h)
+        return h
+
+model = GNNModel(in_feats=768, hidden_feats=512, out_feats=len(encoder.classes_)).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.7)
+criterion = nn.CrossEntropyLoss()
+
+# ===================== #
+# --- Train Model --- #
+# ===================== #
+best_accuracy = 0.0
+num_epochs = 200
+
+for epoch in range(num_epochs):
+    model.train()
+    logits = model(graph_train, features_train)
+    loss = criterion(logits, labels_train)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+
+    y_train_pred = np.argmax(logits.detach().cpu().numpy(), axis=1)
+    train_accuracy = accuracy_score(np.argmax(y_train_oh, axis=1), y_train_pred)
+
+    print(f"Epoch {epoch + 1}, Loss: {loss.item():.4f}, Accuracy: {train_accuracy:.4f}")
+
+    if train_accuracy > best_accuracy:
+        best_accuracy = train_accuracy
+        torch.save(model.state_dict(), "gnn_bert_model_best.pth")
+
+    if loss.item() < 0.001:
+        break
+
+model.load_state_dict(torch.load("gnn_bert_model_best.pth"))
+
+# ============================= #
+# --- Evaluate on Train/Test --- #
+# ============================= #
+model.eval()
+with torch.no_grad():
+    train_logits = model(graph_train, features_train)
+    train_preds = np.argmax(train_logits.cpu().numpy(), axis=1)
+    train_accuracy = accuracy_score(y_train, train_preds)
+    train_precision, train_recall, train_f1, _ = precision_recall_fscore_support(y_train, train_preds, average='weighted')
+
+    features_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+    graph_test = build_graph(X_test)
+    test_logits = model(graph_test, features_test_tensor)
+    test_preds = np.argmax(test_logits.cpu().numpy(), axis=1)
+    test_accuracy = accuracy_score(y_test, test_preds)
+    test_precision, test_recall, test_f1, _ = precision_recall_fscore_support(y_test, test_preds, average='weighted')
+
+# ============================= #
+# --- Stepwise Outputs on Train (All Samples) --- #
+# ============================= #
+# print("\n# Full Training Stepwise Outputs")
+# y_train_true_samples = []
+# y_train_pred_samples = []
+#
+# for idx, row in train_df.iterrows():
+#     orig_text = row[text_column]
+#     tokens, tnp, tns, tokens_stem, final_text = preprocess_kannada_text_stepwise(orig_text)
+#     print(f"\nTrain Sample {idx + 1}: {orig_text}")
+#     print(f"Step 1 - Tokenize: {tokens}")
+#     print(f"Step 2 - After Punctuation Removal: {tnp}")
+#     print(f"Step 3 - After Stopwords Removal: {tns}")
+#     print(f"Step 4 - After Stemming (Only Verbs): {tokens_stem}")
+#     print(f"Step 5 - Final Preprocessed Text: {final_text}")
+#
+#     emb = get_bert_embeddings([final_text])
+#     tensor_input = torch.tensor(emb, dtype=torch.float32).to(device)
+#     train_graph = build_graph(emb)
+#     with torch.no_grad():
+#         output = model(train_graph, tensor_input)
+#         pred_label = torch.argmax(output, axis=1).item()
+#         pred_sentiment = encoder.inverse_transform([pred_label])[0]
+#     y_train_true_samples.append(row[label_column])
+#     y_train_pred_samples.append(pred_sentiment)
+#     print(f"Predicted Sentiment: {pred_sentiment}")
+#     print(f"True Sentiment     : {row[label_column]}")
+
+print("\nTraining Performance Metrics:")
+print(f"Accuracy: {train_accuracy:.2f}")
+print(f"Precision: {train_precision:.2f}")
+print(f"Recall: {train_recall:.2f}")
+print(f"F1-Score: {train_f1:.2f}")
+
+# ============================= #
+# --- Stepwise Outputs on Test (All Samples) --- #
+# ============================= #
+# print("\n# Full Testing Stepwise Outputs")
+# y_test_true = []
+# y_test_pred = []
+#
+# for idx, row in test_df.iterrows():
+#     orig_text = row[text_column]
+#     tokens, tnp, tns, tokens_stem, final_text = preprocess_kannada_text_stepwise(orig_text)
+#     print(f"\nTest Sample {idx + 1}: {orig_text}")
+#     print(f"Step 1 - Tokenize: {tokens}")
+#     print(f"Step 2 - After Punctuation Removal: {tnp}")
+#     print(f"Step 3 - After Stopwords Removal: {tns}")
+#     print(f"Step 4 - After Stemming (Only Verbs): {tokens_stem}")
+#     print(f"Step 5 - Final Preprocessed Text: {final_text}")
+#
+#     emb = get_bert_embeddings([final_text])
+#     tensor_input = torch.tensor(emb, dtype=torch.float32).to(device)
+#     test_graph = build_graph(emb)
+#     with torch.no_grad():
+#         output = model(test_graph, tensor_input)
+#         pred_label = torch.argmax(output, axis=1).item()
+#         pred_sentiment = encoder.inverse_transform([pred_label])[0]
+#     y_test_true.append(row[label_column])
+#     y_test_pred.append(pred_sentiment)
+#     print(f"Predicted Sentiment: {pred_sentiment}")
+#     print(f"True Sentiment     : {row[label_column]}")
+
+print("\nTesting Performance Metrics:")
+print(f"Accuracy: {test_accuracy:.2f}")
+print(f"Precision: {test_precision:.2f}")
+print(f"Recall: {test_recall:.2f}")
+print(f"F1-Score: {test_f1:.2f}")
+
+# ============================= #
+# --- User Input Prediction --- #
+# ============================= #
+# user_sentence = input("\nEnter a Kannada sentence for sentiment prediction: ")
+# tokens, tnp, tns, tokens_stem, final_text = preprocess_kannada_text_stepwise(user_sentence)
+# print(f"Step 1 - Tokenize: {tokens}")
+# print(f"Step 2 - After Punctuation Removal: {tnp}")
+# print(f"Step 3 - After Stopwords Removal: {tns}")
+# print(f"Step 4 - After Stemming (Only Verbs): {tokens_stem}")
+# print(f"Step 5 - Final Preprocessed Text: {final_text}")
+# user_emb = get_bert_embeddings([final_text])
+# user_tensor = torch.tensor(user_emb, dtype=torch.float32).to(device)
+# user_graph = build_graph(user_emb)
+# with torch.no_grad():
+#     user_output = model(user_graph, user_tensor)
+#     user_pred_label = torch.argmax(user_output, axis=1).item()
+#     user_sentiment = encoder.inverse_transform([user_pred_label])[0]
+# print("Predicted Sentiment for user input:", user_sentiment)
+
+
+print("\nKannada Sentiment Prediction System")
+print("Press Ctrl + C to stop.\n")
+
+try:
+    while True:
+        user_sentence = input("Enter a Kannada sentence: ").strip()
+        if not user_sentence:
+            print("Empty input. Please enter a valid sentence.\n")
+            continue
+
+        tokens, tnp, tns, tokens_stem, final_text = preprocess_kannada_text_stepwise(user_sentence)
+        print(f"\nStep 1 - Tokenize: {tokens}")
+        print(f"Step 2 - After Punctuation Removal: {tnp}")
+        print(f"Step 3 - After Stopwords Removal: {tns}")
+        print(f"Step 4 - After Stemming (Only Verbs): {tokens_stem}")
+        print(f"Step 5 - Final Preprocessed Text: {final_text}")
+
+        user_emb = get_bert_embeddings([final_text])
+        user_tensor = torch.tensor(user_emb, dtype=torch.float32).to(device)
+        user_graph = build_graph(user_emb)
+        with torch.no_grad():
+            user_output = model(user_graph, user_tensor)
+            user_pred_label = torch.argmax(user_output, axis=1).item()
+            user_sentiment = encoder.inverse_transform([user_pred_label])[0]
+
+        print("\nPredicted Sentiment:", user_sentiment)
+        print("-" * 50 + "\n")
+
+except KeyboardInterrupt:
+    print("\n\nStopped by user (Ctrl + b). Goodbye!")
